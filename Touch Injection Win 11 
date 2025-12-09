@@ -1,0 +1,160 @@
+#include <windows.h>
+#include <shlobj.h>
+#include <shlwapi.h>
+#include <exdisp.h>
+#include <uiautomation.h>
+#include <initguid.h>
+#include <wctype.h>
+
+#pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "uiautomationcore.lib")
+#pragma comment(lib, "oleacc.lib")
+
+int StringCompareW(const wchar_t* a, const wchar_t* b)
+{
+    while (*a && *b && towlower(*a) == towlower(*b)) { a++; b++; }
+    return towlower(*a) - towlower(*b);
+}
+
+HRESULT ComMinimizeRestoreDesktopWindows()
+{
+    IUnknown* pUnk = nullptr;
+    IDispatch* pDisp = nullptr;
+    OLECHAR* methodName = const_cast<OLECHAR*>(L"ToggleDesktop");
+    DISPID dispid = 0;
+    DISPPARAMS params = { 0 };
+    HRESULT hr;
+
+    hr = CoCreateInstance(CLSID_Shell, nullptr, CLSCTX_INPROC_SERVER, IID_IUnknown, (void**)&pUnk);
+    if (FAILED(hr)) goto cleanup;
+    hr = pUnk->QueryInterface(IID_IDispatch, (void**)&pDisp);
+    if (FAILED(hr)) goto cleanup;
+    hr = pDisp->GetIDsOfNames(IID_NULL, &methodName, 1, LOCALE_USER_DEFAULT, &dispid);
+    if (FAILED(hr)) goto cleanup;
+    hr = pDisp->Invoke(dispid, IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_METHOD, &params, nullptr, nullptr, nullptr);
+    Sleep(400);
+
+cleanup:
+    if (pDisp) pDisp->Release();
+    if (pUnk) pUnk->Release();
+    return hr;
+}
+
+BOOL TouchInjectionClickCoord(LONG x, LONG y)
+{
+    POINTER_TOUCH_INFO t = { 0 };
+    t.pointerInfo.pointerType = PT_TOUCH;
+    t.pointerInfo.pointerId = 0;
+    t.pointerInfo.ptPixelLocation.x = x;
+    t.pointerInfo.ptPixelLocation.y = y;
+    t.touchFlags = TOUCH_FLAG_NONE;
+    t.touchMask = TOUCH_MASK_CONTACTAREA | TOUCH_MASK_ORIENTATION | TOUCH_MASK_PRESSURE;
+    t.rcContact = { x - 3, y - 3, x + 3, y + 3 };
+    t.orientation = 90;
+    t.pressure = 32000;
+    t.pointerInfo.pointerFlags = POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT;
+
+    if (!InjectTouchInput(1, &t)) return FALSE;
+
+    Sleep(50); // Natural touch delay
+    t.pointerInfo.pointerFlags = POINTER_FLAG_UP;
+    return InjectTouchInput(1, &t);
+}
+
+BOOL ExecuteBinaryFromTouchInjectionCoord(LONG x, LONG y)
+{
+    if (!TouchInjectionClickCoord(x, y)) return FALSE;
+    Sleep(GetDoubleClickTime() / 4);
+    return TouchInjectionClickCoord(x, y);
+}
+
+int main()
+{
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    IUIAutomation* pAuto = nullptr;
+    IUIAutomationElement* pRoot = nullptr;
+    IUIAutomationElement* pTemp = nullptr;
+    IUIAutomationElement* pIcon = nullptr;
+    IUIAutomationCondition* pCond = nullptr;
+    IUIAutomationElementArray* pArr = nullptr;
+    POINT pt = { 0 };
+    BOOL found = FALSE;
+    HRESULT hr = S_OK;
+    int count = 0;
+    BSTR bstr = nullptr;
+    VARIANT v = { 0 };
+    RECT rc = { 0 };
+
+    if (!InitializeTouchInjection(1, TOUCH_FEEDBACK_DEFAULT))
+        return GetLastError();
+
+    hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr)) return 1;
+
+    hr = CoCreateInstance(__uuidof(CUIAutomation), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pAuto));
+    if (FAILED(hr)) goto cleanup;
+
+    hr = pAuto->GetRootElement(&pRoot);
+    if (FAILED(hr) || !pRoot) goto cleanup;
+
+    VariantInit(&v);
+    v.vt = VT_I4;
+    v.lVal = UIA_ListItemControlTypeId;
+    hr = pAuto->CreatePropertyCondition(UIA_ControlTypePropertyId, v, &pCond);
+    VariantClear(&v);
+    if (FAILED(hr)) goto cleanup;
+
+    hr = pRoot->FindAll(TreeScope_Subtree, pCond, &pArr);
+    pCond->Release(); pCond = nullptr;
+    if (FAILED(hr) || !pArr) goto cleanup;
+
+    pArr->get_Length(&count);
+    for (int i = 0; i < count; ++i)
+    {
+        pArr->GetElement(i, &pTemp);
+        if (!pTemp) continue;
+
+        pTemp->get_CurrentName(&bstr);
+        if (bstr && (StringCompareW(bstr, L"calc.exe") == 0 ||
+            StringCompareW(bstr, L"calc") == 0 ||
+            StringCompareW(bstr, L"Calculator") == 0))
+        {
+            pIcon = pTemp;
+            SysFreeString(bstr); bstr = nullptr;
+            found = TRUE;
+            break;
+        }
+        SysFreeString(bstr); bstr = nullptr;
+        pTemp->Release(); pTemp = nullptr;
+    }
+    pArr->Release(); pArr = nullptr;
+    if (!found || !pIcon) goto cleanup;
+
+    hr = pIcon->get_CurrentBoundingRectangle(&rc);
+    pIcon->Release(); pIcon = nullptr;
+    if (FAILED(hr)) goto cleanup;
+
+    pt.x = (rc.left + rc.right) / 2;
+    pt.y = (rc.top + rc.bottom) / 2;
+
+    ComMinimizeRestoreDesktopWindows();
+    Sleep(800);
+
+    ExecuteBinaryFromTouchInjectionCoord(pt.x, pt.y);
+
+    Sleep(500);
+    ComMinimizeRestoreDesktopWindows();
+
+cleanup:
+    if (pTemp) pTemp->Release();
+    if (pIcon) pIcon->Release();
+    if (pArr) pArr->Release();
+    if (pCond) pCond->Release();
+    if (pRoot) pRoot->Release();
+    if (pAuto) pAuto->Release();
+    if (bstr) SysFreeString(bstr);
+
+    CoUninitialize();
+    return 0;
+}
